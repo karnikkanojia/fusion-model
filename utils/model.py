@@ -131,6 +131,8 @@ class FusionModel(nn.Module):
         # self.features.add_module('relu3', nn.ReLU())
         # self.features.add_module('conv4', nn.Conv2d(1024, 2048, kernel_size=3, padding=1))
         # self.features.add_module('relu4', nn.ReLU())
+        if num_init_features == 4096:
+            self.conv0 = nn.Conv2d(4096, 2048, kernel_size=3, padding=1)
         self.conv1 = nn.Conv2d(2048, 1024, kernel_size=3, padding=1)
         self.relu1 = nn.ReLU()
         self.conv2 = nn.Conv2d(1024, 512, kernel_size=3, padding=1)
@@ -150,6 +152,8 @@ class FusionModel(nn.Module):
             torch.Tensor: The output tensor.
         """
         x = self.feature_extractor(x)
+        if hasattr(self, "conv0"):
+            x = self.conv0(x)
         x = self.conv1(x)
         x = self.relu1(x)
         x = self.conv2(x)

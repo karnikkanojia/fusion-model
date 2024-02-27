@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import sklearn.metrics
 from sklearn.metrics import roc_auc_score, accuracy_score
+from torch.utils.tensorboard import SummaryWriter
 import sklearn, sklearn.model_selection
 import torchxrayvision as xrv
 import logging
@@ -16,6 +17,7 @@ import logging
 from tqdm import tqdm as tqdm_base
 
 logger = logging.getLogger(__name__)
+writer = SummaryWriter()
 
 def tqdm(*args, **kwargs):
     if hasattr(tqdm_base, "_instances"):
@@ -59,7 +61,7 @@ def train(model, dataset, cfg, labels_shape):
 
     # Dataset
     gss = sklearn.model_selection.GroupShuffleSplit(
-        train_size=0.8, test_size=0.2, random_state=cfg.seed
+        train_size=0.3, test_size=0.7, random_state=cfg.seed
     )
     train_inds, test_inds = next(
         gss.split(X=range(len(dataset)), groups=dataset.csv.patientid)
@@ -132,7 +134,7 @@ def train(model, dataset, cfg, labels_shape):
 
     for epoch in range(start_epoch, cfg.num_epochs):
 
-        avg_loss = train_epoch(
+        avg_loss, acc, auc = train_epoch(
             cfg=cfg,
             epoch=epoch,
             model=model,
@@ -163,9 +165,28 @@ def train(model, dataset, cfg, labels_shape):
             "trainloss": avg_loss,
             "validauc": auc_valid,
             "best_metric": best_metric,
+            "acc": acc,
+            "auc": auc
         }
 
         metrics.append(stat)
+        writer.add_scalars(main_tag="Loss",
+                           tag_scalar_dict={"train_loss": avg_loss},
+                           global_step=epoch)
+
+        # Add accuracy results to SummaryWriter
+        writer.add_scalars(main_tag="Accuracy",
+                           tag_scalar_dict={"train_acc": acc},
+                           global_step=epoch)
+
+        writer.add_scalars(main_tag="AUC",
+                            tag_scalar_dict={"train_auc": auc, "valid_auc": auc_valid},
+                            global_step=epoch)
+
+        # Track the PyTorch model architecture
+        writer.add_graph(model=model,
+                         # Pass in an example input
+                         input_to_model=torch.randn(1, 1, 224, 224).to(device))
 
         with open(join(cfg.output_dir, f"{dataset_name}-metrics.pkl"), "wb") as f:
             pickle.dump(metrics, f)
@@ -249,8 +270,11 @@ def train_epoch(
         )
 
         optimizer.step()
+        # get the accuracy score and the roc_auc_score
+        acc = accuracy_score(targets.cpu().numpy(), outputs.cpu().numpy() > 0.5)
+        auc = roc_auc_score(targets.cpu().numpy(), outputs.cpu().numpy())
 
-    return np.mean(avg_loss)
+    return np.mean(avg_loss), acc, auc
 
 
 def valid_test_epoch(name, epoch, model, device, data_loader, criterion, limit=None):

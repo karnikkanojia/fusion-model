@@ -162,3 +162,5 @@ cython_debug/
 # Data file
 nihcc/
 .vscode/
+runs/
+output/
