@@ -1,215 +1,82 @@
-import argparse
-import random
-import numpy as np
-import torch
-import torchvision
-import torchvision.transforms
-import sklearn
-import sklearn.model_selection
-import torchxrayvision as xrv
-import train_utils
-from utils.model import FusionModel
+import os
+import json
+import pytorch_lightning as pl
+from pytorch_lightning.strategies import DDPStrategy
+from datetime import timedelta
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.callbacks import LearningRateMonitor
+from models.model import FusionModelLightning
+from models.datamodule import XRayDataModule
+from simple_parsing import ArgumentParser
+from arguments.training_args import TrainingArguments
+from utils.comfy import dataclass_to_namespace
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-name', type=str)
-    parser.add_argument('--output_dir', type=str, default="./output/")
-    parser.add_argument('--dataset', type=str, default="pc-nih-rsna-siim-vin")
-    parser.add_argument('--dataset_dir', type=str, default="./data")
-    parser.add_argument('--model', type=str, default="custom")
-    parser.add_argument('--seed', type=int, default=42, help='')
-    parser.add_argument('--cuda', type=bool, default=True, help='')
-    parser.add_argument('--mps', type=bool, default=False, help='')
-    parser.add_argument('--num_epochs', type=int, default=400, help='')
-    parser.add_argument('--batch_size', type=int, default=64, help='')
-    parser.add_argument('--shuffle', type=bool, default=True, help='')
-    parser.add_argument('--lr', type=float, default=0.001, help='')
-    parser.add_argument('--threads', type=int, default=4, help='')
-    parser.add_argument('--taskweights', type=bool, default=True, help='')
-    parser.add_argument('--featurereg', type=bool, default=False, help='')
-    parser.add_argument('--weightreg', type=bool, default=False, help='')
-    parser.add_argument('--data_aug', type=bool, default=True, help='')
-    parser.add_argument('--data_aug_rot', type=int, default=45, help='')
-    parser.add_argument('--data_aug_trans', type=float, default=0.15, help='')
-    parser.add_argument('--data_aug_scale', type=float, default=0.15, help='')
-    parser.add_argument('--label_concat', type=bool, default=False, help='')
-    parser.add_argument('--label_concat_reg', type=bool, default=False, help='')
-    parser.add_argument('--labelunion', type=bool, default=False, help='')
-    parser.add_argument('--attention_type', type=str, default="se", help='')
-    parser.add_argument('--fusion_method', type=str, default="concat", help='')
 
-    cfg = parser.parse_args()
-    print(cfg)
+def main(hparams):
+    wandb_logger = WandbLogger(project="fusion-CXR-model", name="default", save_dir="./")
+    pl.seed_everything(hparams.seed)
+    os.makedirs(hparams.output_dir, exist_ok=True)
+    hparams.logger = wandb_logger
 
-    data_aug = None
-    if cfg.data_aug:
-        data_aug = torchvision.transforms.Compose([
-            xrv.datasets.ToPILImage(),
-            torchvision.transforms.RandomEqualize(),
-            torchvision.transforms.RandomAffine(cfg.data_aug_rot,
-                                                translate=(cfg.data_aug_trans, cfg.data_aug_trans),
-                                                scale=(1.0-cfg.data_aug_scale, 1.0+cfg.data_aug_scale)),
-            torchvision.transforms.ToTensor()
-        ])
-        print(data_aug)
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=hparams.output_dir,
+        save_top_k=3,
+        mode="min",
+        monitor="val_loss",
+        filename="{hparams.name}-{epoch:02d}-{val_loss:.4f}",
+    )
+    lr_monitor = LearningRateMonitor(logging_interval="step")
+    hparams.callbacks = [checkpoint_callback, lr_monitor]
 
-    transforms = torchvision.transforms.Compose([
-        xrv.datasets.XRayCenterCrop(),
-        xrv.datasets.XRayResizer(224)
-    ])
+    if hparams.accelerator == "cpu" and hparams.valid_on_cpu is True:
+        print("If you run on cpu, valid must go on cpu, It set automatically")
+        hparams.valid_on_cpu = False
+    elif hparams.strategy == "ddp":
+        hparams.strategy = DDPStrategy(timeout=timedelta(days=30))
+    elif hparams.strategy == "deepspeed_stage_2":
+        if hparams.deepspeed_config is not None:
+            from pytorch_lightning.strategies import DeepSpeedStrategy
 
-    datas = []
-    datas_names = []
-    if "nih" in cfg.dataset:
-        dataset = xrv.datasets.NIH_Dataset(
-            imgpath=cfg.dataset_dir + "/images-512-NIH",
-            transform=transforms, data_aug=data_aug, unique_patients=False, views=["PA","AP"])
-        datas.append(dataset)
-        datas_names.append("nih")
-    if "pc" in cfg.dataset:
-        dataset = xrv.datasets.PC_Dataset(
-            imgpath=cfg.dataset_dir + "/images-512-PC", 
-            transform=transforms, data_aug=data_aug, unique_patients=False, views=["PA","AP"])
-        datas.append(dataset)
-        datas_names.append("pc")
-    if "chex" in cfg.dataset:
-        dataset = xrv.datasets.CheX_Dataset(
-            imgpath=cfg.dataset_dir + "/CheXpert-v1.0-small",
-            csvpath=cfg.dataset_dir + "/CheXpert-v1.0-small/train.csv",
-            transform=transforms, data_aug=data_aug, unique_patients=False)
-        datas.append(dataset)
-        datas_names.append("chex")
-    if "google" in cfg.dataset:
-        dataset = xrv.datasets.NIH_Google_Dataset(
-            imgpath=cfg.dataset_dir + "/images-512-NIH",
-            transform=transforms, data_aug=data_aug)
-        datas.append(dataset)
-        datas_names.append("google")
-    if "mimic_ch" in cfg.dataset:
-        dataset = xrv.datasets.MIMIC_Dataset(
-            imgpath="/scratch/users/joecohen/data/MIMICCXR-2.0/files/",
-            csvpath=cfg.dataset_dir + "/MIMICCXR-2.0/mimic-cxr-2.0.0-chexpert.csv.gz",
-            metacsvpath=cfg.dataset_dir + "/MIMICCXR-2.0/mimic-cxr-2.0.0-metadata.csv.gz",
-            transform=transforms, data_aug=data_aug, unique_patients=False, views=["PA","AP"])
-        datas.append(dataset)
-        datas_names.append("mimic_ch")
-    if "openi" in cfg.dataset:
-        dataset = xrv.datasets.Openi_Dataset(
-            imgpath=cfg.dataset_dir + "/OpenI/images/",
-            transform=transforms, data_aug=data_aug)
-        datas.append(dataset)
-        datas_names.append("openi")
-    if "rsna" in cfg.dataset:
-        dataset = xrv.datasets.RSNA_Pneumonia_Dataset(
-            imgpath=cfg.dataset_dir + "/kaggle-pneumonia-jpg/stage_2_train_images_jpg",
-            transform=transforms, data_aug=data_aug, unique_patients=False, views=["PA","AP"])
-        datas.append(dataset)
-        datas_names.append("rsna")
-    if "siim" in cfg.dataset:
-        dataset = xrv.datasets.SIIM_Pneumothorax_Dataset(
-            imgpath=cfg.dataset_dir + "/SIIM_TRAIN_TEST/dicom-images-train",
-            csvpath=cfg.dataset_dir + "/SIIM_TRAIN_TEST/train-rle.csv",
-            transform=transforms, data_aug=data_aug)
-        datas.append(dataset)
-        datas_names.append("siim")
-    if "vin" in cfg.dataset:
-        dataset = xrv.datasets.VinBrain_Dataset(
-            imgpath=cfg.dataset_dir + "vinbigdata-chest-xray-abnormalities-detection/train",
-            csvpath=cfg.dataset_dir + "vinbigdata-chest-xray-abnormalities-detection/train.csv",
-            transform=transforms, data_aug=data_aug)
-        datas.append(dataset)
-        datas_names.append("vin")
+            hparams.strategy = DeepSpeedStrategy(config=hparams.deepspeed_config)
+    elif hparams.accelerator != "cpu" and (hparams.strategy is not None and "deepspeed" in hparams.strategy):
+        raise NotImplementedError("If you want to another deepspeed option and config, PLZ IMPLEMENT FIRST!!")
+    trainer = pl.Trainer(
+        accelerator=hparams.accelerator,
+        strategy="auto",
+        deterministic=True,
+        logger=hparams.logger,
+    )
 
-    print("datas_names", datas_names)
+    datamodule = XRayDataModule(hparams)
+    labels_length = datamodule.get_label_length()
+    model = FusionModelLightning(hparams.dimension, hparams.attention_type, hparams.fusion_method, labels_length)
+    wandb_logger.watch(model, log="all")
+    trainer.fit(model, datamodule=datamodule)
+    """
+    # TODO If use config like dict follow this line
+    but, model param is duplicated area between training param and model param
+    I want to get training param on run script argument, so I can not use it
+    """
+    # config_cls = load_config(hparams.config_dir)
+    # config = config_to_dict(config_cls)
+    # with open(os.path.join(hparams.output_dir, "config.json"), "w") as f:
+    # json.dump(config, f, ensure_ascii=False, indent=4)
+    # TODO If finetuning follow this line
+    # PreTrainedLightningModule.load_state_dict(
+    #     torch.load(
+    #         "",
+    #         map_location="cuda",
+    #     ),
+    #     strict=False,
+    # )
+    print(checkpoint_callback.best_model_path)
 
-    if cfg.labelunion:
-        newlabels = set()
-        for d in datas:
-            newlabels = newlabels.union(d.pathologies)
-
-        if "Support Devices" in newlabels:
-            newlabels.remove("Support Devices")
-        print(list(newlabels))
-        for d in datas:
-            xrv.datasets.relabel_dataset(list(newlabels), d)
-    else:
-        for d in datas:
-            xrv.datasets.relabel_dataset(xrv.datasets.default_pathologies, d)
-
-    #cut out training sets
-    train_datas = []
-    test_datas = []
-    for i, dataset in enumerate(datas):
-
-        # give patientid if not exist
-        if "patientid" not in dataset.csv:
-            dataset.csv["patientid"] = ["{}-{}".format(dataset.__class__.__name__, i) for i in range(len(dataset))]
-
-        gss = sklearn.model_selection.GroupShuffleSplit(train_size=0.1,test_size=0.9, random_state=cfg.seed)
-
-        train_inds, test_inds = next(gss.split(X=range(len(dataset)), groups=dataset.csv.patientid))
-        train_dataset = xrv.datasets.SubsetDataset(dataset, train_inds)
-        test_dataset = xrv.datasets.SubsetDataset(dataset, test_inds)
-
-        train_datas.append(train_dataset)
-        test_datas.append(test_dataset)
-
-    if len(datas) == 0:
-        raise Exception("no dataset")
-    elif len(datas) == 1:
-        train_dataset = train_datas[0]
-        test_dataset = test_datas[0]
-    else:
-        print("merge datasets")
-        train_dataset = xrv.datasets.Merge_Dataset(train_datas)
-        test_dataset = xrv.datasets.Merge_Dataset(test_datas)
-
-    # Setting the seed
-    np.random.seed(cfg.seed)
-    random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-    if cfg.cuda:
-        torch.cuda.manual_seed_all(cfg.seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-    print("train_dataset.labels.shape", train_dataset.labels.shape)
-    print("test_dataset.labels.shape", test_dataset.labels.shape)
-    print("train_dataset",train_dataset)
-    print("test_dataset",test_dataset)
-
-    # create models
-    if "custom" in cfg.model:
-        if cfg.fusion_method == "concat":
-            model = FusionModel(1, 4096, cfg.attention_type, cfg.fusion_method, train_dataset.labels.shape[1])
-        else:
-            model = FusionModel(1, 2048, cfg.attention_type, cfg.fusion_method, train_dataset.labels.shape[1])
-    elif "densenet" in cfg.model:
-        model = xrv.models.DenseNet(num_classes=train_dataset.labels.shape[1], in_channels=1,
-                                    **xrv.models.get_densenet_params(cfg.model)) 
-    elif "resnet101" in cfg.model:
-        model = torchvision.models.resnet101(num_classes=train_dataset.labels.shape[1], pretrained=False)
-        #patch for single channel
-        model.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-
-    elif "resnet50" in cfg.model:
-        model = torchvision.models.resnet50(num_classes=train_dataset.labels.shape[1], pretrained=False)
-        #patch for single channel
-        model.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-
-    elif "shufflenet_v2_x2_0" in cfg.model:
-        model = torchvision.models.shufflenet_v2_x2_0(num_classes=train_dataset.labels.shape[1], pretrained=False)
-        #patch for single channel
-        model.conv1[0] = torch.nn.Conv2d(1, 24, kernel_size=3, stride=2, padding=1, bias=False)
-    elif "squeezenet1_1" in cfg.model:
-        model = torchvision.models.squeezenet1_1(num_classes=train_dataset.labels.shape[1], pretrained=False)
-        #patch for single channel
-        model.features[0] = torch.nn.Conv2d(1, 64, kernel_size=3, stride=2, padding=1, bias=False)
-    else:
-        raise Exception("no model")
-
-    train_utils.train(model, train_dataset, cfg, train_dataset.labels.shape[1])
-    print("Done")
 
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser()
+    args = parser.parse_args()
+    args = dataclass_to_namespace(args, "training_args")
+    # Add TrainingArguments to args
+    training_args = TrainingArguments()
+    main(training_args)

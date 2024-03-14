@@ -3,11 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchxrayvision as xrv
 from attention import Attention
-from collections import OrderedDict
 import torch
 import torchxrayvision as xrv
 from attention import Attention
-from collections import OrderedDict
+import pytorch_lightning as pl
 
 
 class FeatureExtractor(nn.Module):
@@ -114,23 +113,15 @@ class FusionModel(nn.Module):
 
     """
 
-    def __init__(self, in_channels, num_init_features, attention_type, fusion_method, train_label_shape):
+    def __init__(
+        self,
+        num_init_features,
+        attention_type,
+        fusion_method,
+        train_label_shape,
+    ):
         super(FusionModel, self).__init__()
         self.feature_extractor = FeatureExtractor(attention_type, fusion_method)
-        # self.features = nn.Sequential(OrderedDict([
-        #     ('conv0', nn.Conv2d(in_channels, num_init_features, kernel_size=7, stride=2, padding=3, bias=False)),
-        #     ('norm0', nn.BatchNorm2d(num_init_features)),
-        #     ('relu0', nn.ReLU(inplace=True)),
-        #     ('pool0', nn.MaxPool2d(kernel_size=3, stride=2, padding=1)),
-        # ]))
-        # self.features.add_module('conv1', nn.Conv2d(64, 128, kernel_size=3, padding=1))
-        # self.features.add_module('relu1', nn.ReLU())
-        # self.features.add_module('conv2', nn.Conv2d(128, 256, kernel_size=3, padding=1))
-        # self.features.add_module('relu2', nn.ReLU())
-        # self.features.add_module('conv3', nn.Conv2d(512, 1024, kernel_size=3, padding=1))
-        # self.features.add_module('relu3', nn.ReLU())
-        # self.features.add_module('conv4', nn.Conv2d(1024, 2048, kernel_size=3, padding=1))
-        # self.features.add_module('relu4', nn.ReLU())
         if num_init_features == 4096:
             self.conv0 = nn.Conv2d(4096, 2048, kernel_size=3, padding=1)
         self.conv1 = nn.Conv2d(2048, 1024, kernel_size=3, padding=1)
@@ -139,7 +130,9 @@ class FusionModel(nn.Module):
         self.relu2 = nn.ReLU()
         self.conv3 = nn.Conv2d(512, train_label_shape, kernel_size=1)
         self.relu3 = nn.ReLU()
-        self.features = nn.Sequential(self.conv1, self.relu1, self.conv2, self.relu2, self.conv3, self.relu3)
+        self.features = nn.Sequential(
+            self.conv1, self.relu1, self.conv2, self.relu2, self.conv3, self.relu3
+        )
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.flatten = nn.Flatten()
         self.classifier = nn.Linear(train_label_shape, train_label_shape)
@@ -163,12 +156,73 @@ class FusionModel(nn.Module):
         x = self.avgpool(x)
         x = self.flatten(x)
         x = self.classifier(x)
-        x = nn.Sigmoid()(x)
+        x = nn.Softmax(dim=1)(x)
         return x
 
 
+class FusionModelLightning(pl.LightningModule):
+    def __init__(self, num_init_features, attention_type, fusion_method, train_label_shape, learning_rate=1e-3):
+        super(FusionModelLightning, self).__init__()
+        self.save_hyperparameters()
+        
+        # FeatureExtractor internal setup
+        self.feature_extractor = FeatureExtractor(attention_type, fusion_method)
+        if num_init_features == 4096:
+            self.conv0 = torch.nn.Conv2d(4096, 2048, kernel_size=3, padding=1)
+        self.conv1 = torch.nn.Conv2d(2048, 1024, kernel_size=3, padding=1)
+        self.relu1 = torch.nn.ReLU()
+        self.conv2 = torch.nn.Conv2d(1024, 512, kernel_size=3, padding=1)
+        self.relu2 = torch.nn.ReLU()
+        self.conv3 = torch.nn.Conv2d(512, train_label_shape, kernel_size=1)
+        self.relu3 = torch.nn.ReLU()
+        self.features = torch.nn.Sequential(
+            self.conv1, self.relu1, self.conv2, self.relu2, self.conv3, self.relu3
+        )
+        self.avgpool = torch.nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = torch.nn.Flatten()
+        self.classifier = torch.nn.Linear(train_label_shape, train_label_shape)
+        self.learning_rate = learning_rate
+
+    def forward(self, x):
+        x = self.feature_extractor(x)
+        if hasattr(self, "conv0"):
+            x = self.conv0(x)
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = self.flatten(x)
+        x = self.classifier(x)
+        x = F.softmax(x, dim=1)
+        return x
+
+    def training_step(self, batch, batch_idx):
+        idx, y, x = batch.values()
+        y_hat = self(x)
+        loss = F.cross_entropy(y_hat, y)
+        self.log('train_loss', loss)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        return optimizer
+
+    # Optionally, add validation and test steps
+    def validation_step(self, batch, batch_idx):
+        idx, y, x = batch.values()
+        y_hat = self(x)
+        loss = F.cross_entropy(y_hat, y)
+        self.log('val_loss', loss)
+
+    def test_step(self, batch, batch_idx):
+        idx, y, x = batch.values()
+        y_hat = self(x)
+        loss = F.cross_entropy(y_hat, y)
+        self.log('test_loss', loss)
+
+
 if __name__ == "__main__":
-    x = torch.rand(1, 1, 256, 256)
-    model = FusionModel("se", "max", 14)
+    x = torch.rand(2, 1, 256, 256)
+    model = FusionModel(2048, "se", "max", 14)
+    model = xrv.models.DenseNet(weights="densenet121-res224-all")
     output = model(x)
     print(output.shape)
+    print(output)
